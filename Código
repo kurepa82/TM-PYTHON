@@ -1,0 +1,191 @@
+# ==============================================================================
+# PROYECTO: CLASIFICACIÓN DE GESTOS EN TIEMPO REAL CON TEACHABLE MACHINE Y COLAB
+# FORMATO: TensorFlow Lite (.tflite) + Interfaz Webcam JavaScript
+# ==============================================================================
+
+import io
+import cv2
+import base64
+import numpy as np
+import tensorflow as tf
+from IPython.display import display, Javascript, Image as IPyImage, clear_output
+from google.colab.output import eval_js
+
+# ------------------------------------------------------------------------------
+# 1. CARGA DEL MODELO Y CONFIGURACIÓN DE PARÁMETROS
+# ------------------------------------------------------------------------------
+MODEL_PATH = "model_unquant.tflite"
+LABELS_PATH = "labels.txt"
+
+print("Cargando modelo TFLite y etiquetas...")
+try:
+    interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    with open(LABELS_PATH, "r", encoding="utf-8") as f:
+        class_names = [line.strip() for line in f.readlines()]
+
+    print("¡Modelo cargado exitosamente!")
+    print(f"Clases detectadas ({len(class_names)}): {class_names}\n")
+
+except FileNotFoundError as e:
+    raise SystemExit(
+        f"Error: No se encontró el archivo necesario ({e.filename}). "
+        "Asegúrate de haber subido 'model_unquant.tflite' y 'labels.txt' al entorno de Colab."
+    )
+
+# ------------------------------------------------------------------------------
+# 2. INTERFAZ WEBCAM INTERACTIVA (PUENTE JAVASCRIPT -> PYTHON)
+# ------------------------------------------------------------------------------
+def take_photo_interactive(quality=0.8):
+    """
+    Despliega un visor de video interactivo en el navegador usando JavaScript.
+    Permite capturar un fotograma con efecto espejo o terminar la ejecución.
+    
+    Args:
+        quality (float): Calidad de compresión JPEG (de 0.0 a 1.0).
+        
+    Returns:
+        str: Imagen codificada en Base64, 'stop' o 'permission_denied'.
+    """
+    js = Javascript('''
+        async function runCamera(quality) {
+            // Contenedor principal de la interfaz
+            const div = document.createElement('div');
+            div.style.marginBottom = '12px';
+
+            // Elemento de video con efecto espejo para coincidir con Teachable Machine
+            const video = document.createElement('video');
+            video.style.display = 'block';
+            video.style.transform = 'scaleX(-1)';
+            video.width = 320;
+            video.height = 240;
+
+            // Contenedor de botones
+            const btnContainer = document.createElement('div');
+            btnContainer.style.marginTop = '8px';
+
+            // Botón de captura de gesto
+            const captureBtn = document.createElement('button');
+            captureBtn.textContent = '📸 Capturar Gesto';
+            captureBtn.style.padding = '8px 16px';
+            captureBtn.style.marginRight = '10px';
+            captureBtn.style.fontSize = '14px';
+            captureBtn.style.fontWeight = 'bold';
+            captureBtn.style.cursor = 'pointer';
+
+            // Botón para finalizar la ejecución
+            const stopBtn = document.createElement('button');
+            stopBtn.textContent = '🛑 Finalizar';
+            stopBtn.style.padding = '8px 16px';
+            stopBtn.style.fontSize = '14px';
+            stopBtn.style.cursor = 'pointer';
+
+            btnContainer.appendChild(captureBtn);
+            btnContainer.appendChild(stopBtn);
+            div.appendChild(video);
+            div.appendChild(btnContainer);
+            document.body.appendChild(div);
+
+            // Solicitud de acceso al hardware de la cámara
+            let stream;
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({video: true});
+            } catch (err) {
+                div.remove();
+                return 'permission_denied';
+            }
+
+            video.srcObject = stream;
+            await video.play();
+            google.colab.output.setIframeHeight(document.documentElement.scrollHeight, true);
+
+            // Pausa hasta que el usuario decida capturar o salir
+            const action = await new Promise((resolve) => {
+                captureBtn.onclick = () => resolve('capture');
+                stopBtn.onclick = () => resolve('stop');
+            });
+
+            // Opción: Finalizar sesión
+            if (action === 'stop') {
+                stream.getVideoTracks()[0].stop();
+                div.remove();
+                return 'stop';
+            }
+
+            // Opción: Capturar fotograma exacto
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            canvas.getContext('2d').drawImage(video, 0, 0);
+            
+            // Apagar cámara y remover interfaz visual
+            stream.getVideoTracks()[0].stop();
+            div.remove();
+            return canvas.toDataURL('image/jpeg', quality);
+        }
+    ''')
+    display(js)
+    return eval_js(f'runCamera({quality})')
+
+# ------------------------------------------------------------------------------
+# 3. BUCLE PRINCIPAL DE INFERENCIA Y CLASIFICACIÓN
+# ------------------------------------------------------------------------------
+while True:
+    data = take_photo_interactive()
+
+    # Validación de permisos de cámara
+    if data == 'permission_denied':
+        print("\n⚠️ Acceso denegado a la cámara.")
+        print("Habilita el permiso de cámara en los controles del sitio de tu navegador y vuelve a ejecutar la celda.")
+        break
+
+    # Cierre voluntario de la sesión
+    if data == 'stop':
+        clear_output(wait=True)
+        print("Sesión finalizada con éxito. ¡Gracias por participar!")
+        break
+
+    # Decodificación de la imagen en Base64
+    binary = base64.b64decode(data.split(',')[1])
+    temp_filename = 'captura.jpg'
+    with open(temp_filename, 'wb') as f:
+        f.write(binary)
+
+    # Preprocesamiento de la imagen:
+    # 1. cv2.flip(..., 1) aplica el efecto espejo necesario para coincidir con Teachable Machine
+    # 2. Conversión a RGB
+    # 3. Redimensionamiento a 224x224 píxeles (tamaño estándar requerido por el modelo)
+    # 4. Normalización de valores de píxeles al rango [-1, 1]
+    image = cv2.imread(temp_filename)
+    image = cv2.flip(image, 1)
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image_resized = cv2.resize(image_rgb, (224, 224), interpolation=cv2.INTER_AREA)
+
+    image_array = np.asarray(image_resized, dtype=np.float32).reshape(1, 224, 224, 3)
+    image_normalized = (image_array / 127.5) - 1.0
+
+    # Inferencia con TensorFlow Lite
+    interpreter.set_tensor(input_details[0]['index'], image_normalized)
+    interpreter.invoke()
+    prediction = interpreter.get_tensor(output_details[0]['index'])
+
+    # Identificación de la clase con mayor probabilidad
+    index = np.argmax(prediction[0])
+    clase_detectada = class_names[index]
+    confianza = prediction[0][index] * 100
+
+    # Presentación limpia de resultados en pantalla
+    clear_output(wait=True)
+    print("=" * 45)
+    print(f"👉 GESTO DETECTADO: {clase_detectada}")
+    print(f"🎯 NIVEL DE CERTEZA: {confianza:.2f}%")
+    print("=" * 45)
+
+    # Mostrar la imagen procesada tal como la evaluó la IA
+    processed_display_path = 'captura_evaluada.jpg'
+    cv2.imwrite(processed_display_path, cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
+    display(IPyImage(processed_display_path, width=320))
